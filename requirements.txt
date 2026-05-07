@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+websockets
+asyncpg
+sqlalchemy
+openai
+faiss-cpu
+python-dotenv
