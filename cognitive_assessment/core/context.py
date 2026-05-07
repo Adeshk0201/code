@@ -13,14 +13,8 @@ class SectionState:
     completed: bool = False
 
     def add_interaction(self, question: str, answer: str, score: float, confidence: float):
-        self.history.append({
-            "q": question,
-            "a": answer,
-            "score": score,
-            "confidence": confidence
-        })
+        self.history.append({"q": question, "a": answer, "score": score, "confidence": confidence})
         self.question_count += 1
-        # Running average
         n = self.question_count
         self.score = ((self.score * (n - 1)) + score) / n
         self.confidence = ((self.confidence * (n - 1)) + confidence) / n
@@ -37,6 +31,9 @@ class Context:
     current_question: Optional[str] = None
 
     memory_summary: str = ""
+    stm_context: str = ""
+    semantic_context: str = ""
+
     global_history: list = field(default_factory=list)
     assessment_complete: bool = False
     stop_reason: Optional[str] = None
@@ -54,7 +51,7 @@ class Context:
             question=self.current_question,
             answer=answer,
             score=score,
-            confidence=confidence
+            confidence=confidence,
         )
         self.global_history.append({
             "section": self.current_section,
@@ -62,8 +59,12 @@ class Context:
             "a": answer,
         })
 
+    def inject_memory(self, memory: dict):
+        self.stm_context = memory.get("stm_recent", "")
+        self.semantic_context = memory.get("semantic_relevant", "")
+        self.memory_summary = memory.get("memory_summary", "")
+
     def get_context_snapshot(self) -> dict:
-        """Returns serializable context for LLM agents."""
         return {
             "patient": self.patient.model_dump(),
             "caretaker": self.caretaker.model_dump(),
@@ -72,9 +73,11 @@ class Context:
                 "question_count": self.active_section.question_count,
                 "score": round(self.active_section.score, 3),
                 "confidence": round(self.active_section.confidence, 3),
-                "history": self.active_section.history[-3:],  # last 3 only
+                "history": self.active_section.history[-3:],
             },
             "memory_summary": self.memory_summary,
+            "stm_context": self.stm_context,
+            "semantic_context": self.semantic_context,
             "assessment_complete": self.assessment_complete,
         }
 

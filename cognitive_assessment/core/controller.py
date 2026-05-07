@@ -3,121 +3,99 @@ from core.context import Context
 from core.stopping_conditions import StoppingConditions
 from core.section_manager import SectionManager
 from models.schemas import PatientInfo, CaretakerTruth
+from agents.agent_orchestrator import AgentOrchestrator
+from memory.memory_manager import MemoryManager
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 
 class AssessmentController:
-    """
-    Central orchestrator. Controls the assessment loop.
-    Agents will be plugged in here in next phase.
-    """
-
-    def __init__(self):
+    def __init__(self, db_session):
         self.section_manager = SectionManager()
         self.stopping = StoppingConditions()
         self.sessions: dict[str, Context] = {}
+        self.memory_managers: dict[str, MemoryManager] = {}
+        self.orchestrator = AgentOrchestrator()
+        self.db_session = db_session
 
     def create_session(self, patient: PatientInfo, caretaker: CaretakerTruth) -> Context:
         session_id = str(uuid.uuid4())
-        ctx = Context(
-            session_id=session_id,
-            patient=patient,
-            caretaker=caretaker,
-        )
+        ctx = Context(session_id=session_id, patient=patient, caretaker=caretaker)
         self.sessions[session_id] = ctx
-        logger.info(f"Session created: {session_id} | Patient: {patient.name}")
+        self.memory_managers[session_id] = MemoryManager(self.db_session)
+        logger.info(f"Session created: {session_id}")
         return ctx
 
     def get_session(self, session_id: str) -> Context | None:
         return self.sessions.get(session_id)
 
-    def generate_question(self, ctx: Context) -> str:
-        """
-        STUB: In next phase, this calls QuestionAgent(LLM).
-        For now returns deterministic placeholder.
-        """
-        section = ctx.current_section
-        count = ctx.active_section.question_count
-        hint = self.section_manager.get_section_prompt_hint(section)
+    def _mm(self, session_id: str) -> MemoryManager:
+        return self.memory_managers[session_id]
 
-        # Placeholder questions per section
-        placeholders = {
-            "orientation": [
-                "What is today's date?",
-                "What day of the week is it?",
-                "What city are we currently in?",
-                "What season is it right now?",
-                "Can you tell me the name of this place?",
-            ],
-            "memory": [
-                "I will say 3 words: Apple, Table, Penny. Please remember them.",
-                "Can you repeat those 3 words back to me?",
-                "What did you have for breakfast today?",
-                "What is the name of the current Prime Minister of India?",
-                "Earlier I mentioned 3 words — can you recall them?",
-            ],
-            "reasoning": [
-                "If you have 10 rupees and spend 3, how many do you have?",
-                "What do a train and a bus have in common?",
-                "Count backwards from 20 to 1.",
-                "What would you do if you found a stamped envelope on the street?",
-                "Spell the word 'WORLD' backwards.",
-            ],
-        }
+    async def generate_question(self, ctx: Context) -> str:
+        # Build memory context
+        mem = await self._mm(ctx.session_id).build_memory_context(
+            ctx.current_question or ctx.current_section
+        )
+        ctx.inject_memory(mem)
+        snapshot = ctx.get_context_snapshot()
+        question = await self.orchestrator.get_question(snapshot)
+        ctx.current_question = question
+        return question
 
-        questions = placeholders.get(section, ["Tell me how you are feeling today."])
-        q = questions[count % len(questions)]
-        ctx.current_question = q
-        return q
+    async def process_answer(self, ctx: Context, answer: str) -> dict:
+        snapshot = ctx.get_context_snapshot()
 
-    def process_answer(self, ctx: Context, answer: str) -> dict:
-        """
-        STUB: In next phase, calls ConfidenceAgent + ScoringAgent.
-        For now uses dummy scoring.
-        """
-        # Dummy: score 1.0 if answer is non-empty and long enough
-        score = 1.0 if len(answer.strip()) > 3 else 0.3
-        confidence = min(0.5 + (ctx.active_section.question_count * 0.15), 1.0)
+        conf_result = await self.orchestrator.get_confidence(snapshot, answer)
+        confidence = conf_result["confidence"]
+
+        score_result = await self.orchestrator.score_section(
+            section=ctx.current_section,
+            history=ctx.active_section.history,
+            caretaker=ctx.caretaker.model_dump(),
+        )
+        score = score_result["section_score"]
 
         ctx.update_after_answer(answer=answer, score=score, confidence=confidence)
-        logger.info(
-            f"[{ctx.session_id}] Section={ctx.current_section} | "
-            f"Q#{ctx.active_section.question_count} | Score={score} | Conf={confidence:.2f}"
+
+        # Record in memory
+        await self._mm(ctx.session_id).record_interaction(
+            session_id=ctx.session_id,
+            section=ctx.current_section,
+            question=ctx.current_question,
+            answer=answer,
+            score=score,
+            confidence=confidence,
         )
         return {"score": score, "confidence": confidence}
 
-    def step(self, session_id: str, answer: str) -> dict:
-        """
-        Main assessment loop step.
-        Called after every user answer.
-        Returns next question OR completion status.
-        """
+    async def step(self, session_id: str, answer: str) -> dict:
         ctx = self.get_session(session_id)
         if not ctx:
             return {"error": "Session not found"}
-
         if ctx.assessment_complete:
-            return self._completion_response(ctx)
+            return await self._completion_response(ctx)
 
-        # 1. Process answer
-        self.process_answer(ctx, answer)
+        await self.process_answer(ctx, answer)
 
-        # 2. Check stopping
         stop, reason = self.stopping.should_stop_section(ctx.active_section)
-
         if stop:
-            logger.info(f"[{ctx.session_id}] Section '{ctx.current_section}' stopping: {reason}")
+            # Persist section score
+            sec = ctx.active_section
+            await self._mm(session_id).persist_section_complete(
+                session_id=session_id,
+                section=ctx.current_section,
+                score=sec.score,
+                confidence=sec.confidence,
+                question_count=sec.question_count,
+                observations="",
+            )
             moved = self.section_manager.transition_section(ctx, reason)
-
             if not moved:
-                # Assessment complete
-                return self._completion_response(ctx)
+                return await self._completion_response(ctx)
 
-        # 3. Generate next question
-        next_q = self.generate_question(ctx)
-
+        next_q = await self.generate_question(ctx)
         return {
             "type": "question",
             "session_id": session_id,
@@ -127,13 +105,14 @@ class AssessmentController:
             "context_snapshot": ctx.get_context_snapshot(),
         }
 
-    def start(self, session_id: str) -> dict:
-        """Called once to begin the assessment."""
+    async def start(self, session_id: str) -> dict:
         ctx = self.get_session(session_id)
         if not ctx:
             return {"error": "Session not found"}
-
-        first_q = self.generate_question(ctx)
+        await self._mm(session_id).persist_session_start(
+            session_id, ctx.patient, ctx.caretaker.model_dump()
+        )
+        first_q = await self.generate_question(ctx)
         return {
             "type": "question",
             "session_id": session_id,
@@ -143,11 +122,24 @@ class AssessmentController:
             "context_snapshot": ctx.get_context_snapshot(),
         }
 
-    def _completion_response(self, ctx: Context) -> dict:
+    async def _completion_response(self, ctx: Context) -> dict:
+        consistency = await self.orchestrator.check_consistency(
+            patient_history=ctx.global_history,
+            caretaker=ctx.caretaker.model_dump(),
+        )
+        report = await self.orchestrator.generate_report(
+            scores=ctx.get_full_scores(),
+            consistency=consistency,
+            patient=ctx.patient.model_dump(),
+        )
+        await self._mm(ctx.session_id).persist_report(ctx.session_id, report, consistency)
+        ctx.assessment_complete = True
         return {
             "type": "complete",
             "session_id": ctx.session_id,
             "stop_reason": ctx.stop_reason,
             "scores": ctx.get_full_scores(),
+            "consistency": consistency,
+            "report": report,
             "total_questions": len(ctx.global_history),
         }
